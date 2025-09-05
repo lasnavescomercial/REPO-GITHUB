@@ -1,5 +1,8 @@
 name: Build Catalog
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -17,6 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # keep creds so we can push output/
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,8 +33,14 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
+      # Enrich: find official image + PDF and write RESUMEN_CATALOGO_READY.xlsx
+      - name: Enrich URLs
+        run: |
+          python scripts/enrich_urls.py --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}" --out "data/RESUMEN_CATALOGO_READY.xlsx"
+
+      # Download using the enriched file
       - name: Run downloader
-        run: python scripts/download_catalog.py --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}"
+        run: python scripts/download_catalog.py --excel "data/RESUMEN_CATALOGO_READY.xlsx"
 
       - name: Upload artifact (CATALOGO.zip)
         uses: actions/upload-artifact@v4
@@ -35,10 +48,11 @@ jobs:
           name: CATALOGO_ZIP
           path: CATALOGO.zip
 
+      # Optional: commit browsable output/ tree back to the repo
       - name: Commit output folder
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output || true
+          git add -A output || true
           git commit -m "Output catalog $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No changes to commit"
           git push
