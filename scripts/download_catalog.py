@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, sys, zipfile
+import os, re, sys, unicodedata, zipfile, math
 from pathlib import Path
 import requests, pandas as pd
+
+def is_empty(val) -> bool:
+    if val is None: return True
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)): return True
+    s = str(val).strip()
+    return s == "" or s.lower() == "nan" or s == "None"
 
 def sanitize(s):
     if s is None: return ""
@@ -79,34 +85,35 @@ def main():
     s.headers.update({"User-Agent":"Mozilla/5.0"})
 
     total = len(df)
-    with_url = 0
+    tried = 0
 
     for i, row in df.iterrows():
-        cod_art = sanitize(row.get(COL_COD_ART,""))
-        ref_prov = sanitize(row.get(COL_REF_PROV,""))
-        proveedor = sanitize(row.get(COL_PROVEEDOR,""))
-        cod_prov = sanitize(row.get(COL_COD_PROV,""))
-        uimg = str(row.get(COL_URL_IMG,"") or "").strip()
-        updf = str(row.get(COL_URL_FICHA,"") or "").strip()
+        cod_art = sanitize(row.get(COL_COD_ART, ""))
+        ref_prov = sanitize(row.get(COL_REF_PROV, ""))
+        proveedor = sanitize(row.get(COL_PROVEEDOR, ""))
+        cod_prov = sanitize(row.get(COL_COD_PROV, ""))
+
+        # Treat NaN / blanks as empty
+        uimg = "" if is_empty(row.get(COL_URL_IMG)) else str(row.get(COL_URL_IMG)).strip()
+        updf = "" if is_empty(row.get(COL_URL_FICHA)) else str(row.get(COL_URL_FICHA)).strip()
 
         if not cod_art or not ref_prov or not proveedor or not cod_prov:
-            print(f"[{i+1}/{total}] SKIP: missing key fields")
+            print(f'[{i+1}/{total}] SKIP: missing key fields')
             continue
 
         base = f"{cod_art} - {ref_prov}"
         img_dir = OUTPUT_ROOT / "IMAGENES" / f"{cod_prov} - {proveedor}"
-        pdf_dir = OUTPUT_ROOT / "FICHAS" / f"{cod_prov} - {proveedor}"
+        pdf_dir = OUTPUT_ROOT / "FICHAS"  / f"{cod_prov} - {proveedor}"
 
         if uimg:
             ok, msg = download(uimg, img_dir / (base + ".jpg"), s, force_jpg=True)
             print(f"[IMG] {base}: {msg}")
-            with_url += 1
+            tried += 1
         if updf:
             ok, msg = download(updf, pdf_dir / (base + ".pdf"), s, force_jpg=False)
             print(f"[PDF] {base}: {msg}")
-            with_url += 1
+            tried += 1
 
-    # zip
     with zipfile.ZipFile(ZIP_NAME, "w", zipfile.ZIP_DEFLATED) as z:
         for folder, _, files in os.walk(OUTPUT_ROOT):
             for f in files:
@@ -114,17 +121,11 @@ def main():
                 arc = os.path.relpath(full, start=os.path.dirname(OUTPUT_ROOT))
                 z.write(full, arc)
 
-    # also commit a browsable copy under /output
-    out_dir = Path("output")
-    out_dir.mkdir(exist_ok=True)
-    import shutil
-    if (out_dir / "CATALOGO").exists():
-        shutil.rmtree(out_dir / "CATALOGO")
-    if OUTPUT_ROOT.exists():
-        shutil.copytree(OUTPUT_ROOT, out_dir / "CATALOGO")
-
-    print(f"[OK] Done. Rows: {total}. Downloads attempted (with URLs): {with_url}.")
+    print(f"[OK] Done. Rows: {total}. Downloads attempted (with URLs): {tried}.")
 
 if __name__ == "__main__":
-    from PIL import Image  # optional; only used if converting to JPG
+    try:
+        from PIL import Image  # optional
+    except Exception:
+        pass
     main()
