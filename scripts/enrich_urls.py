@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, unicodedata, time, sys, csv
+import os, re, unicodedata, time, sys, csv, math
 from pathlib import Path
 import requests, pandas as pd
 from bs4 import BeautifulSoup
@@ -17,7 +17,7 @@ ALIASES = {
     "JIMTEN":  ["JIMTEN", "JIMTEN SA", "JIMTEN, S.A.", "JIMTEN S.A", "JIMTEN S A"],
     "ESPA":    ["ESPA", "ESPA 2020", "ESPA PUMPS", "ESPA PUMPS IBERICA", "ESPA PUMPS IBÉRICA"],
     "GENEBRE": ["GENEBRE", "GENEBRE SA", "GENEBRE, S.A.", "GENEBRE S.A", "GENEBRE S A"],
-    # Intermediaries you may have (skip brand here, but we’ll still try all brands as fallback)
+    # Intermediaries you may have (skip brand here, but try all brands as fallback)
     "":        ["FAMARA", "LAS NAVES", "ALMACENES", "DISTRIBUIDOR"]
 }
 
@@ -30,6 +30,12 @@ COLS = {
     "img":     "URL Imagen Oficial",
     "pdf":     "URL Ficha Técnica Oficial",
 }
+
+def is_empty(val) -> bool:
+    if val is None: return True
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)): return True
+    s = str(val).strip()
+    return s == "" or s.lower() == "nan" or s == "None"
 
 def norm_text(s:str)->str:
     s = str(s or "").strip().upper()
@@ -52,7 +58,6 @@ def canonical_brand(raw:str)->str:
     return ""
 
 def ddg_search(domain:str, query:str, session:requests.Session, max_hits=6):
-    # Very simple HTML search (no API key)
     url = "https://duckduckgo.com/html/"
     q = f"site:{domain} {query}"
     r = session.get(url, params={"q": q}, timeout=30)
@@ -122,20 +127,24 @@ def pick_image_from_page(url:str, session:requests.Session):
         return None
 
 def try_enrich_for_brand(prov_canon:str, ref:str, art:str, session:requests.Session):
-    # search in brand’s official domains with short queries: reference first, then reference+name
+    # Normalize reference variants (remove dots/spaces, also try dashless)
+    ref_variants = {ref}
+    ref_variants.add(re.sub(r"[.\s]+","", ref))
+    ref_variants.add(ref.replace("-", ""))
     for d in OFFICIAL.get(prov_canon, []):
-        for q in (ref, f"{ref} {art}"):
-            hits = ddg_search(d, q, session)
-            if hits:
-                # pick first "likely" product page
-                for h in hits:
-                    bad = ("/search", "/busc", "/tag/", "/category", "/noticias", "/blog", "/catalogo_corporativo")
-                    if any(s in h.lower() for s in bad):
-                        continue
-                    pdf = pick_pdf_from_page(h, session)
-                    img = pick_image_from_page(h, session)
-                    if pdf or img:
-                        return img, pdf, h, d, q
+        for base in ref_variants:
+            for q in (base, f"{base} {art}"):
+                hits = ddg_search(d, q, session)
+                if hits:
+                    # pick first likely product page
+                    for h in hits:
+                        bad = ("/search", "/busc", "/tag/", "/category", "/noticias", "/blog", "/catalogo_corporativo")
+                        if any(s in h.lower() for s in bad):
+                            continue
+                        pdf = pick_pdf_from_page(h, session)
+                        img = pick_image_from_page(h, session)
+                        if pdf or img:
+                            return img, pdf, h, d, q
     return None, None, None, None, None
 
 def main():
@@ -162,15 +171,16 @@ def main():
 
     total = len(df); filled = 0
     report_rows = []
+
     for i, row in df.iterrows():
-        cod_art  = str(row.get(COLS["cod_art"]) or "").strip()
+        cod_art  = row.get(COLS["cod_art"])
         ref      = str(row.get(COLS["refprov"]) or "").strip()
         art      = str(row.get(COLS["art"]) or "").strip()
         prov_raw = str(row.get(COLS["prov"]) or "").strip()
         prov     = canonical_brand(prov_raw)
 
-        need_img = not str(row.get(COLS["img"]) or "").strip()
-        need_pdf = not str(row.get(COLS["pdf"]) or "").strip()
+        need_img = is_empty(row.get(COLS["img"]))
+        need_pdf = is_empty(row.get(COLS["pdf"]))
 
         status = "skipped"
         found_img = None; found_pdf = None; page = None; used_brand = prov; dom = None; q = None
@@ -189,7 +199,7 @@ def main():
                     status = "filled"
                     found_img, found_pdf, used_brand = img, pdf, prov
                     filled += 1
-            # Fallback: if brand unknown, try all three brands
+            # Fallback: try all brands if nothing yet (handles intermediaries like FAMARA)
             if status != "filled":
                 for prov2 in ("JIMTEN","ESPA","GENEBRE"):
                     img, pdf, page, dom, q = try_enrich_for_brand(prov2, ref, art, s)
@@ -219,11 +229,11 @@ def main():
             "status": status
         })
 
-        time.sleep(0.7)  # be polite
+        time.sleep(0.6)  # be polite
 
     df.to_excel(args.out, index=False)
 
-    # Write a CSV report we can download as artifact
+    # Write CSV report
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     with open(args.report, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
