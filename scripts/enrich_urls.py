@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, unicodedata, time, sys
+import os, re, unicodedata, time, sys, csv
 from pathlib import Path
 import requests, pandas as pd
 from bs4 import BeautifulSoup
 
+# Official domains we trust
 OFFICIAL = {
     "JIMTEN": ["jimten.com", "catalogo.jimten.com"],
-    "ESPA":   ["espa.com", "espapumps.co.uk"],
+    "ESPA":   ["espa.com", "psp.espa.com", "espapumps.co.uk"],
     "GENEBRE":["genebre.com"],
+}
+
+# Common aliases as they often appear in real spreadsheets
+ALIASES = {
+    "JIMTEN":  ["JIMTEN", "JIMTEN SA", "JIMTEN, S.A.", "JIMTEN S.A", "JIMTEN S A"],
+    "ESPA":    ["ESPA", "ESPA 2020", "ESPA PUMPS", "ESPA PUMPS IBERICA", "ESPA PUMPS IBÉRICA"],
+    "GENEBRE": ["GENEBRE", "GENEBRE SA", "GENEBRE, S.A.", "GENEBRE S.A", "GENEBRE S A"],
+    # Intermediaries you may have (skip brand here, but we’ll still try all brands as fallback)
+    "":        ["FAMARA", "LAS NAVES", "ALMACENES", "DISTRIBUIDOR"]
 }
 
 COLS = {
@@ -21,17 +31,28 @@ COLS = {
     "pdf":     "URL Ficha Técnica Oficial",
 }
 
-def norm_brand(s:str)->str:
-    s = (s or "").strip().upper()
+def norm_text(s:str)->str:
+    s = str(s or "").strip().upper()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^A-Z0-9]+"," ",s).strip()
-    if "JIMTEN" in s: return "JIMTEN"
-    if "ESPA" in s: return "ESPA"
-    if "GENEBRE" in s: return "GENEBRE"
-    return s
+    return re.sub(r"[^A-Z0-9]+", " ", s).strip()
 
-def ddg_search(domain:str, query:str, session:requests.Session, max_hits=5):
+def canonical_brand(raw:str)->str:
+    n = norm_text(raw)
+    if not n:
+        return ""
+    for canon, variants in ALIASES.items():
+        for v in variants:
+            if norm_text(v) == n:
+                return canon
+    # heuristic contains
+    for canon in ("JIMTEN","ESPA","GENEBRE"):
+        if canon in n:
+            return canon
+    return ""
+
+def ddg_search(domain:str, query:str, session:requests.Session, max_hits=6):
+    # Very simple HTML search (no API key)
     url = "https://duckduckgo.com/html/"
     q = f"site:{domain} {query}"
     r = session.get(url, params={"q": q}, timeout=30)
@@ -42,8 +63,8 @@ def ddg_search(domain:str, query:str, session:requests.Session, max_hits=5):
         href = a.get("href")
         if href and domain in href:
             hits.append(href)
-        if len(hits) >= max_hits:
-            break
+            if len(hits) >= max_hits:
+                break
     return hits
 
 def pick_pdf_from_page(url:str, session:requests.Session):
@@ -72,12 +93,14 @@ def pick_image_from_page(url:str, session:requests.Session):
         if r.headers.get("Content-Type","").lower().startswith("image/"):
             return url
         soup = BeautifulSoup(r.text, "lxml")
+        # 1) og:image
         og = soup.select_one('meta[property="og:image"], meta[name="og:image"]')
         if og and og.get("content"):
             candidate = requests.compat.urljoin(url, og["content"])
             ct = session.get(candidate, timeout=30, stream=True).headers.get("Content-Type","").lower()
             if ct.startswith("image/"):
                 return candidate
+        # 2) fallback: biggest inline image by width*height (if attrs available)
         best = None; best_area = 0
         for img in soup.select("img[src]"):
             src = img["src"]
@@ -88,8 +111,7 @@ def pick_image_from_page(url:str, session:requests.Session):
                 head = session.get(candidate, timeout=30, stream=True)
                 ct = head.headers.get("Content-Type","").lower()
                 if ct.startswith("image/"):
-                    w = int(img.get("width") or 0)
-                    h = int(img.get("height") or 0)
+                    w = int(img.get("width") or 0); h = int(img.get("height") or 0)
                     area = w*h
                     if area > best_area:
                         best_area, best = area, candidate
@@ -99,39 +121,29 @@ def pick_image_from_page(url:str, session:requests.Session):
     except Exception:
         return None
 
-def enrich_row(row, session):
-    prov = norm_brand(row.get(COLS["prov"]))
-    ref  = str(row.get(COLS["refprov"]) or "").strip()
-    art  = str(row.get(COLS["art"]) or "").strip()
-    if not prov or prov not in OFFICIAL or not ref:
-        return None, None
-    domains = OFFICIAL[prov]
-    found_page = None
-    pdf_url = None
-    img_url = None
-    for d in domains:
+def try_enrich_for_brand(prov_canon:str, ref:str, art:str, session:requests.Session):
+    # search in brand’s official domains with short queries: reference first, then reference+name
+    for d in OFFICIAL.get(prov_canon, []):
         for q in (ref, f"{ref} {art}"):
             hits = ddg_search(d, q, session)
-            for h in hits:
-                if any(s in h.lower() for s in ("/search", "/busc", "/tag/", "/category", "/noticias", "/blog")):
-                    continue
-                found_page = h
-                break
-            if found_page:
-                break
-        if found_page:
-            pdf_url = pick_pdf_from_page(found_page, session)
-            img_url = pick_image_from_page(found_page, session)
-            if pdf_url or img_url:
-                break
-        time.sleep(1)
-    return img_url, pdf_url
+            if hits:
+                # pick first "likely" product page
+                for h in hits:
+                    bad = ("/search", "/busc", "/tag/", "/category", "/noticias", "/blog", "/catalogo_corporativo")
+                    if any(s in h.lower() for s in bad):
+                        continue
+                    pdf = pick_pdf_from_page(h, session)
+                    img = pick_image_from_page(h, session)
+                    if pdf or img:
+                        return img, pdf, h, d, q
+    return None, None, None, None, None
 
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--excel", default="data/RESUMEN_CATALOGO.xlsx")
     ap.add_argument("--out",    default="data/RESUMEN_CATALOGO_READY.xlsx")
+    ap.add_argument("--report", default="data/ENRICHMENT_REPORT.csv")
     args = ap.parse_args()
 
     if not os.path.exists(args.excel):
@@ -139,6 +151,8 @@ def main():
         sys.exit(1)
 
     df = pd.read_excel(args.excel, sheet_name=0)
+
+    # ensure URL columns exist
     for key in ("img","pdf"):
         if COLS[key] not in df.columns:
             df[COLS[key]] = ""
@@ -147,21 +161,77 @@ def main():
     s.headers.update({"User-Agent":"Mozilla/5.0"})
 
     total = len(df); filled = 0
+    report_rows = []
     for i, row in df.iterrows():
+        cod_art  = str(row.get(COLS["cod_art"]) or "").strip()
+        ref      = str(row.get(COLS["refprov"]) or "").strip()
+        art      = str(row.get(COLS["art"]) or "").strip()
+        prov_raw = str(row.get(COLS["prov"]) or "").strip()
+        prov     = canonical_brand(prov_raw)
+
         need_img = not str(row.get(COLS["img"]) or "").strip()
         need_pdf = not str(row.get(COLS["pdf"]) or "").strip()
-        if need_img or need_pdf:
-            img, pdf = enrich_row(row, s)
-            changed = False
-            if img and need_img:
-                df.at[i, COLS["img"]] = img; changed = True
-            if pdf and need_pdf:
-                df.at[i, COLS["pdf"]] = pdf; changed = True
-            if changed: filled += 1
-            time.sleep(0.8)
+
+        status = "skipped"
+        found_img = None; found_pdf = None; page = None; used_brand = prov; dom = None; q = None
+
+        if not (need_img or need_pdf):
+            status = "already had URLs"
+        else:
+            # If brand is recognized, try that brand first
+            tried = False
+            if prov in OFFICIAL:
+                img, pdf, page, dom, q = try_enrich_for_brand(prov, ref, art, s)
+                tried = True
+                if img or pdf:
+                    if need_img and img: df.at[i, COLS["img"]] = img
+                    if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
+                    status = "filled"
+                    found_img, found_pdf, used_brand = img, pdf, prov
+                    filled += 1
+            # Fallback: if brand unknown, try all three brands
+            if status != "filled":
+                for prov2 in ("JIMTEN","ESPA","GENEBRE"):
+                    img, pdf, page, dom, q = try_enrich_for_brand(prov2, ref, art, s)
+                    if img or pdf:
+                        if need_img and img: df.at[i, COLS["img"]] = img
+                        if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
+                        status = "filled"
+                        found_img, found_pdf, used_brand = img, pdf, prov2
+                        filled += 1
+                        break
+                if status != "filled" and tried:
+                    status = "no match on brand"
+                elif status != "filled":
+                    status = "no match any brand"
+
+        report_rows.append({
+            "row": i+1,
+            "cod_articulo_naves": cod_art,
+            "ref_proveedor": ref,
+            "proveedor_raw": prov_raw,
+            "brand_used": used_brand,
+            "query_domain": dom or "",
+            "query": q or "",
+            "product_page": page or "",
+            "found_image": found_img or "",
+            "found_pdf": found_pdf or "",
+            "status": status
+        })
+
+        time.sleep(0.7)  # be polite
 
     df.to_excel(args.out, index=False)
-    print(f"[OK] Enrichment done. Rows: {total}. Rows updated: {filled}. Output: {args.out}")
+
+    # Write a CSV report we can download as artifact
+    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.report, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
+        w.writeheader()
+        w.writerows(report_rows)
+
+    print(f"[OK] Enrichment done. Rows: {total}. Rows updated: {filled}.")
+    print(f"[OK] Outputs: {args.out} and {args.report}")
 
 if __name__ == "__main__":
     main()
