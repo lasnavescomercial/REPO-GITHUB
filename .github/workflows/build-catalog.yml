@@ -32,17 +32,26 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      # Enrich: find official image + PDF and write RESUMEN_CATALOGO_READY.xlsx
+      # Enrich: find official image + PDF and write the enriched file + report
       - name: Enrich URLs
         run: |
-          python scripts/enrich_urls.py --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}" --out "data/RESUMEN_CATALOGO_READY.xlsx"
+          python scripts/enrich_urls.py \
+            --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}" \
+            --out   "data/RESUMEN_CATALOGO_READY.xlsx" \
+            --report "data/ENRICHMENT_REPORT.csv"
 
-      # Upload the enriched Excel so you can inspect what was found
+      # Debug artifacts so you can inspect what was found
       - name: Upload enriched Excel (for debug)
         uses: actions/upload-artifact@v4
         with:
           name: RESUMEN_CATALOGO_READY
           path: data/RESUMEN_CATALOGO_READY.xlsx
+
+      - name: Upload enrichment report (for debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ENRICHMENT_REPORT
+          path: data/ENRICHMENT_REPORT.csv
 
       # Download using the enriched file
       - name: Run downloader
