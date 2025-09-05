@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, unicodedata, time, sys, csv, math
+import os, re, unicodedata, time, sys, csv, math, urllib.parse
 from pathlib import Path
 import requests, pandas as pd
 from bs4 import BeautifulSoup
 
-# Official domains we trust
-OFFICIAL = {
-    "JIMTEN": ["jimten.com", "catalogo.jimten.com"],
-    "ESPA":   ["espa.com", "psp.espa.com", "espapumps.co.uk"],
-    "GENEBRE":["genebre.com"],
-}
+print("[INFO] Engine: GOOGLE CSE (webwide)")
 
-# Common aliases as they often appear in real spreadsheets
+# Aliases de marcas
 ALIASES = {
     "JIMTEN":  ["JIMTEN", "JIMTEN SA", "JIMTEN, S.A.", "JIMTEN S.A", "JIMTEN S A"],
     "ESPA":    ["ESPA", "ESPA 2020", "ESPA PUMPS", "ESPA PUMPS IBERICA", "ESPA PUMPS IBÉRICA"],
     "GENEBRE": ["GENEBRE", "GENEBRE SA", "GENEBRE, S.A.", "GENEBRE S.A", "GENEBRE S A"],
-    # Intermediaries you may have (skip brand here, but try all brands as fallback)
-    "":        ["FAMARA", "LAS NAVES", "ALMACENES", "DISTRIBUIDOR"]
+    "":        ["FAMARA", "LAS NAVES", "ALMACENES", "DISTRIBUIDOR", "PROVEEDOR"]
 }
 
 COLS = {
@@ -29,6 +23,12 @@ COLS = {
     "codprov": "Cód. Proveedor",
     "img":     "URL Imagen Oficial",
     "pdf":     "URL Ficha Técnica Oficial",
+}
+
+BLACKLIST = {
+    "amazon.", "ebay.", "aliexpress.", "alibaba.", "leroymerlin.", "manomano.",
+    "pinterest.", "facebook.", "instagram.", "youtube.", "issuu.", "scribd.",
+    "mercadolibre.", "wikipedia.", "reddit.", "x.com", "tiktok.", "linkedin."
 }
 
 def is_empty(val) -> bool:
@@ -51,26 +51,29 @@ def canonical_brand(raw:str)->str:
         for v in variants:
             if norm_text(v) == n:
                 return canon
-    # heuristic contains
-    for canon in ("JIMTEN","ESPA","GENEBRE"):
+    for canon in ("JIMTEN","ESPA","GENEBRE","FLUIDRA"):
         if canon in n:
             return canon
     return ""
 
-def ddg_search(domain:str, query:str, session:requests.Session, max_hits=6):
-    url = "https://duckduckgo.com/html/"
-    q = f"site:{domain} {query}"
-    r = session.get(url, params={"q": q}, timeout=30)
+# -------- Google Programmable Search (CSE) - web completa --------
+def google_search_all(query: str, session: requests.Session, max_hits=8):
+    key = os.environ.get("GOOGLE_CSE_KEY")
+    cx  = os.environ.get("GOOGLE_CSE_CX")
+    if not key or not cx:
+        raise RuntimeError("Missing GOOGLE_CSE_KEY or GOOGLE_CSE_CX (set repo secrets).")
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+    params = {"key": key, "cx": cx, "q": query, "num": max_hits}
+    r = session.get(endpoint, params=params, timeout=30)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    data = r.json()
     hits = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href")
-        if href and domain in href:
-            hits.append(href)
-            if len(hits) >= max_hits:
-                break
+    for item in data.get("items", []) or []:
+        url = item.get("link")
+        if url:
+            hits.append(url)
     return hits
+# -----------------------------------------------------------------
 
 def pick_pdf_from_page(url:str, session:requests.Session):
     try:
@@ -98,14 +101,12 @@ def pick_image_from_page(url:str, session:requests.Session):
         if r.headers.get("Content-Type","").lower().startswith("image/"):
             return url
         soup = BeautifulSoup(r.text, "lxml")
-        # 1) og:image
         og = soup.select_one('meta[property="og:image"], meta[name="og:image"]')
         if og and og.get("content"):
             candidate = requests.compat.urljoin(url, og["content"])
             ct = session.get(candidate, timeout=30, stream=True).headers.get("Content-Type","").lower()
             if ct.startswith("image/"):
                 return candidate
-        # 2) fallback: biggest inline image by width*height (if attrs available)
         best = None; best_area = 0
         for img in soup.select("img[src]"):
             src = img["src"]
@@ -126,25 +127,47 @@ def pick_image_from_page(url:str, session:requests.Session):
     except Exception:
         return None
 
-def try_enrich_for_brand(prov_canon:str, ref:str, art:str, session:requests.Session):
-    # Normalize reference variants (remove dots/spaces, also try dashless)
-    ref_variants = {ref}
-    ref_variants.add(re.sub(r"[.\s]+","", ref))
-    ref_variants.add(ref.replace("-", ""))
-    for d in OFFICIAL.get(prov_canon, []):
-        for base in ref_variants:
-            for q in (base, f"{base} {art}"):
-                hits = ddg_search(d, q, session)
-                if hits:
-                    # pick first likely product page
-                    for h in hits:
-                        bad = ("/search", "/busc", "/tag/", "/category", "/noticias", "/blog", "/catalogo_corporativo")
-                        if any(s in h.lower() for s in bad):
-                            continue
-                        pdf = pick_pdf_from_page(h, session)
-                        img = pick_image_from_page(h, session)
-                        if pdf or img:
-                            return img, pdf, h, d, q
+def domain_host(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+def is_blacklisted(host: str) -> bool:
+    return any(bad in host for bad in BLACKLIST)
+
+def looks_like_brand_site(host: str, brand: str) -> bool:
+    if not brand: return False
+    return brand.lower() in host
+
+def try_enrich_webwide(brand: str, ref: str, art: str, session: requests.Session):
+    ref_vars = {ref, re.sub(r"[.\s]+","", ref), ref.replace("-", "")}
+    queries = []
+    for rv in ref_vars:
+        queries += [rv, f"{rv} {art}".strip()]
+        if brand:
+            queries += [f"{brand} {rv}", f"{brand} {rv} {art}".strip()]
+
+    candidates, seen = [], set()
+    for q in queries:
+        if not q.strip(): 
+            continue
+        hits = google_search_all(q, session)
+        for u in hits:
+            if u not in seen:
+                seen.add(u); candidates.append(u)
+
+    for prefer_brand in (True, False):
+        for url in candidates:
+            host = domain_host(url)
+            if is_blacklisted(host): 
+                continue
+            if prefer_brand and brand and not looks_like_brand_site(host, brand):
+                continue
+            pdf = pick_pdf_from_page(url, session)
+            img = pick_image_from_page(url, session)
+            if pdf or img:
+                return img, pdf, url, host, "brand-pass" if prefer_brand else "open-pass"
     return None, None, None, None, None
 
 def main():
@@ -160,8 +183,6 @@ def main():
         sys.exit(1)
 
     df = pd.read_excel(args.excel, sheet_name=0)
-
-    # ensure URL columns exist
     for key in ("img","pdf"):
         if COLS[key] not in df.columns:
             df[COLS[key]] = ""
@@ -170,75 +191,53 @@ def main():
     s.headers.update({"User-Agent":"Mozilla/5.0"})
 
     total = len(df); filled = 0
-    report_rows = []
+    rows = []
 
     for i, row in df.iterrows():
         cod_art  = row.get(COLS["cod_art"])
         ref      = str(row.get(COLS["refprov"]) or "").strip()
         art      = str(row.get(COLS["art"]) or "").strip()
         prov_raw = str(row.get(COLS["prov"]) or "").strip()
-        prov     = canonical_brand(prov_raw)
+        brand    = canonical_brand(prov_raw)
 
         need_img = is_empty(row.get(COLS["img"]))
         need_pdf = is_empty(row.get(COLS["pdf"]))
 
         status = "skipped"
-        found_img = None; found_pdf = None; page = None; used_brand = prov; dom = None; q = None
+        found_img = None; found_pdf = None; page = None; used_pass = None; host = None
 
         if not (need_img or need_pdf):
             status = "already had URLs"
         else:
-            # If brand is recognized, try that brand first
-            tried = False
-            if prov in OFFICIAL:
-                img, pdf, page, dom, q = try_enrich_for_brand(prov, ref, art, s)
-                tried = True
-                if img or pdf:
-                    if need_img and img: df.at[i, COLS["img"]] = img
-                    if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
-                    status = "filled"
-                    found_img, found_pdf, used_brand = img, pdf, prov
-                    filled += 1
-            # Fallback: try all brands if nothing yet (handles intermediaries like FAMARA)
-            if status != "filled":
-                for prov2 in ("JIMTEN","ESPA","GENEBRE"):
-                    img, pdf, page, dom, q = try_enrich_for_brand(prov2, ref, art, s)
-                    if img or pdf:
-                        if need_img and img: df.at[i, COLS["img"]] = img
-                        if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
-                        status = "filled"
-                        found_img, found_pdf, used_brand = img, pdf, prov2
-                        filled += 1
-                        break
-                if status != "filled" and tried:
-                    status = "no match on brand"
-                elif status != "filled":
-                    status = "no match any brand"
+            img, pdf, page, host, used_pass = try_enrich_webwide(brand, ref, art, s)
+            if img or pdf:
+                if need_img and img: df.at[i, COLS["img"]] = img
+                if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
+                status = "filled"; found_img, found_pdf = img, pdf; filled += 1
+            else:
+                status = "no match"
 
-        report_rows.append({
+        rows.append({
             "row": i+1,
             "cod_articulo_naves": cod_art,
             "ref_proveedor": ref,
             "proveedor_raw": prov_raw,
-            "brand_used": used_brand,
-            "query_domain": dom or "",
-            "query": q or "",
+            "brand_detected": brand or "",
+            "chosen_host": host or "",
+            "search_pass": used_pass or "",
             "product_page": page or "",
             "found_image": found_img or "",
             "found_pdf": found_pdf or "",
             "status": status
         })
-
-        time.sleep(0.6)  # be polite
+        time.sleep(0.3)
 
     df.to_excel(args.out, index=False)
 
-    # Write CSV report
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
     with open(args.report, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
-        w.writeheader()
-        w.writerows(report_rows)
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
 
     print(f"[OK] Enrichment done. Rows: {total}. Rows updated: {filled}.")
     print(f"[OK] Outputs: {args.out} and {args.report}")
