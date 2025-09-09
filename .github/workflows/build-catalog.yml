@@ -18,8 +18,8 @@ on:
         description: 'Fila inicial (0-based) para procesar por lotes'
         required: false
         default: '0'
-      brand_only:
-        description: 'Procesar SOLO filas cuya marca detectada sea esta (p.ej. FLUIDRA). Vacío = todas'
+      provider_contains:
+        description: 'Procesar SOLO filas cuyo campo "Proveedor" contenga este texto (ej.: FLUIDRA). Vacío = todas'
         required: false
         default: 'FLUIDRA'
   push:
@@ -64,7 +64,7 @@ jobs:
             --limit "${{ github.event.inputs.rows_limit }}" \
             --offset "${{ github.event.inputs.offset }}" \
             --sleep-ms 1100 \
-            --brand-only "${{ github.event.inputs.brand_only }}"
+            --provider-contains "${{ github.event.inputs.provider_contains }}"
 
       - name: Upload enriched Excel (for debug)
         uses: actions/upload-artifact@v4
@@ -79,7 +79,10 @@ jobs:
           path: data/ENRICHMENT_REPORT.csv
 
       - name: Run downloader
-        run: python scripts/download_catalog.py --excel "data/RESUMEN_CATALOGO_READY.xlsx"
+        run: |
+          python scripts/download_catalog.py \
+            --excel "data/RESUMEN_CATALOGO_READY.xlsx" \
+            --provider-contains "${{ github.event.inputs.provider_contains }}"
 
       - name: Upload artifact (CATALOGO.zip)
         uses: actions/upload-artifact@v4
