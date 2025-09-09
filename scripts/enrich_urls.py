@@ -251,4 +251,71 @@ def main():
                     "found_pdf": "",
                     "status": "skipped_by_rule"
                 })
-                cont
+                continue
+
+            need_img = is_empty(row.get(COLS["img"]))
+            need_pdf = is_empty(row.get(COLS["pdf"]))
+
+            status = "skipped"
+            found_img = None; found_pdf = None; page = None; used_pass = None; host = None
+
+            if not (need_img or need_pdf):
+                status = "already had URLs"
+            else:
+                try:
+                    img, pdf, page, host, used_pass = try_enrich_webwide(brand, ref, art, s, sleep_s)
+                except Exception as e:
+                    if "429" in str(e):
+                        raise QuotaExceeded("429 Too Many Requests from Google CSE")
+                    else:
+                        raise
+                if img or pdf:
+                    if need_img and img: df.at[i, COLS["img"]] = img
+                    if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
+                    status = "filled"; found_img, found_pdf = img, pdf; filled += 1
+                else:
+                    status = "no match"
+
+            rows.append({
+                "row": i+1,
+                "cod_articulo_naves": cod_art,
+                "ref_proveedor": ref,
+                "proveedor_raw": prov_raw,
+                "brand_detected": brand or "",
+                "chosen_host": host or "",
+                "search_pass": used_pass or "",
+                "product_page": page or "",
+                "found_image": found_img or "",
+                "found_pdf": found_pdf or "",
+                "status": status
+            })
+
+    except QuotaExceeded as e:
+        print(f"[WARN] {e}. Guardando progreso parcial…")
+        for j in range(len(rows) + start, end):
+            r = df.iloc[j]
+            rows.append({
+                "row": j+1,
+                "cod_articulo_naves": r.get(COLS["cod_art"]),
+                "ref_proveedor": r.get(COLS["refprov"]),
+                "proveedor_raw": r.get(COLS["prov"]),
+                "brand_detected": "",
+                "chosen_host": "",
+                "search_pass": "quota_exceeded",
+                "product_page": "",
+                "found_image": "",
+                "found_pdf": "",
+                "status": "quota_exceeded"
+            })
+    finally:
+        df.to_excel(args.out, index=False)
+        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+        if rows:
+            with open(args.report, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader(); w.writerows(rows)
+        print(f"[OK] Enrichment partial/complete. Rows updated: {filled}.")
+        print(f"[OK] Outputs: {args.out} and {args.report}")
+
+if __name__ == "__main__":
+    main()
