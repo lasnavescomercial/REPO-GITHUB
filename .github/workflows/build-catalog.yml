@@ -10,6 +10,14 @@ on:
         description: 'Excel path (default: data/RESUMEN_CATALOGO.xlsx)'
         required: false
         default: 'data/RESUMEN_CATALOGO.xlsx'
+      rows_limit:
+        description: 'Máximo de filas a procesar en esta ejecución (0 = todas)'
+        required: false
+        default: '40'
+      offset:
+        description: 'Fila inicial (0-based) para procesar por lotes'
+        required: false
+        default: '0'
   push:
     paths:
       - 'data/**'
@@ -37,7 +45,6 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      # Pre-chequeo (no imprime los valores, solo confirma que existen)
       - name: Check required secrets
         run: |
           if [ -z "${GOOGLE_CSE_KEY}" ]; then echo "ERROR: GOOGLE_CSE_KEY is missing"; exit 1; fi
@@ -48,8 +55,11 @@ jobs:
         run: |
           python scripts/enrich_urls.py \
             --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}" \
-            --out   "data/RESUMEN_CATALOGO_READY.xlsx" \
-            --report "data/ENRICHMENT_REPORT.csv"
+            --out "data/RESUMEN_CATALOGO_READY.xlsx" \
+            --report "data/ENRICHMENT_REPORT.csv" \
+            --limit "${{ github.event.inputs.rows_limit }}" \
+            --offset "${{ github.event.inputs.offset }}" \
+            --sleep-ms 1100
 
       - name: Upload enriched Excel (for debug)
         uses: actions/upload-artifact@v4
