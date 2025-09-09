@@ -5,7 +5,7 @@ from pathlib import Path
 import requests, pandas as pd
 from bs4 import BeautifulSoup
 
-print("[INFO] Engine: GOOGLE CSE (webwide)")
+print("[INFO] Engine: GOOGLE CSE (webwide) | Regla: excluir FAMARA | Soporte de marca: FLUIDRA")
 
 # --- Config/constantes ---
 BLACKLIST = {
@@ -13,12 +13,21 @@ BLACKLIST = {
     "pinterest.", "facebook.", "instagram.", "youtube.", "issuu.", "scribd.",
     "mercadolibre.", "wikipedia.", "reddit.", "x.com", "tiktok.", "linkedin."
 }
+
+# Aliases de marcas (detección desde la columna Proveedor)
 ALIASES = {
     "JIMTEN":  ["JIMTEN", "JIMTEN SA", "JIMTEN, S.A.", "JIMTEN S.A", "JIMTEN S A"],
     "ESPA":    ["ESPA", "ESPA 2020", "ESPA PUMPS", "ESPA PUMPS IBERICA", "ESPA PUMPS IBÉRICA"],
     "GENEBRE": ["GENEBRE", "GENEBRE SA", "GENEBRE, S.A.", "GENEBRE S.A", "GENEBRE S A"],
-    "":        ["FAMARA", "LAS NAVES", "ALMACENES", "DISTRIBUIDOR", "PROVEEDOR"]
+    "FLUIDRA": ["FLUIDRA", "FLUIDRA SA", "FLUIDRA S.A", "ZODIAC FLUIDRA", "ASTRALPOOL", "CTX", "CEPEX"],  # marcas del grupo
+    # Intermediarios habituales (no implican marca)
+    "":        ["LAS NAVES", "ALMACENES", "DISTRIBUIDOR", "PROVEEDOR"]
 }
+
+# Proveedores a excluir explícitamente (no buscar nada si el proveedor es alguno de estos)
+EXCLUDE_PROVIDERS = {"FAMARA"}  # se compara normalizado (ver is_excluded_provider)
+
+# Columnas del Excel
 COLS = {
     "cod_art": "Cód. Articulo Naves",
     "refprov": "Referencia Proveedor",
@@ -50,10 +59,16 @@ def canonical_brand(raw:str)->str:
         for v in variants:
             if norm_text(v) == n:
                 return canon
+    # heurística de contiene (incluye FLUIDRA)
     for canon in ("JIMTEN","ESPA","GENEBRE","FLUIDRA"):
         if canon in n:
             return canon
     return ""
+
+def is_excluded_provider(prov_raw: str) -> bool:
+    n = norm_text(prov_raw)
+    # excluye si contiene alguna palabra clave del set
+    return any(word in n for word in (norm_text(x) for x in EXCLUDE_PROVIDERS))
 
 def domain_host(url: str) -> str:
     try:
@@ -65,9 +80,10 @@ def is_blacklisted(host: str) -> bool:
     return any(bad in host for bad in BLACKLIST)
 
 def looks_like_brand_site(host: str, brand: str) -> bool:
+    # preferimos hosts que contengan el nombre de la marca detectada (incluye FLUIDRA)
     return bool(brand) and brand.lower() in host
 
-# --- Búsqueda CSE (con control de cuota) ---
+# --- Búsqueda con Google CSE (toda la web) ---
 class QuotaExceeded(Exception): pass
 
 def google_search_all(query: str, session: requests.Session, sleep_s: float, max_hits=8):
@@ -92,7 +108,7 @@ def google_search_all(query: str, session: requests.Session, sleep_s: float, max
             hits.append(url)
     return hits
 
-# --- Scraping recursos ---
+# --- Scraping de recursos ---
 def pick_pdf_from_page(url:str, session:requests.Session):
     try:
         r = session.get(url, timeout=30)
@@ -145,15 +161,16 @@ def pick_image_from_page(url:str, session:requests.Session):
     except Exception:
         return None
 
-# --- Enriquecimiento por fila ---
+# --- Lógica de enriquecimiento ---
 def try_enrich_webwide(brand: str, ref: str, art: str, session: requests.Session, sleep_s: float):
-    # Variantes + queries (reducidas para ahorrar cuota)
+    # Variantes de referencia (quita puntos/espacios/guiones para ampliar match)
     ref_vars = {ref, re.sub(r"[.\s]+","", ref), ref.replace("-", "")}
     queries = []
     for rv in ref_vars:
         if rv: queries.append(rv)
         if rv and art: queries.append(f"{rv} {art}")
         if brand and rv: queries.append(f"{brand} {rv}")
+        if brand and rv and art: queries.append(f"{brand} {rv} {art}")
 
     candidates, seen = [], set()
     for q in queries:
@@ -162,6 +179,7 @@ def try_enrich_webwide(brand: str, ref: str, art: str, session: requests.Session
             if u not in seen:
                 seen.add(u); candidates.append(u)
 
+    # 1ª pasada: sitios que parezcan de la marca; 2ª pasada: resto (evitando blacklist)
     for prefer_brand in (True, False):
         for url in candidates:
             host = domain_host(url)
@@ -175,7 +193,7 @@ def try_enrich_webwide(brand: str, ref: str, art: str, session: requests.Session
                 return img, pdf, url, host, ("brand-pass" if prefer_brand else "open-pass")
     return None, None, None, None, None
 
-# --- Main ---
+# --- Programa principal ---
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -184,7 +202,7 @@ def main():
     ap.add_argument("--report", default="data/ENRICHMENT_REPORT.csv")
     ap.add_argument("--limit",  type=int, default=0, help="Máx filas a procesar (0=todas)")
     ap.add_argument("--offset", type=int, default=0, help="Fila inicial (0-based)")
-    ap.add_argument("--sleep-ms", type=int, default=1100, help="Pausa entre consultas a CSE")
+    ap.add_argument("--sleep-ms", type=int, default=1100, help="Pausa entre consultas a CSE (ms)")
     args = ap.parse_args()
 
     if not os.path.exists(args.excel):
@@ -207,6 +225,8 @@ def main():
 
     print(f"[INFO] Processing rows {start}..{end-1} of {total} (limit={args.limit}, offset={args.offset})")
 
+    class QuotaExceeded(Exception): pass
+
     try:
         for i in range(start, end):
             row = df.iloc[i]
@@ -216,65 +236,19 @@ def main():
             prov_raw = str(row.get(COLS["prov"]) or "").strip()
             brand    = canonical_brand(prov_raw)
 
-            need_img = is_empty(row.get(COLS["img"]))
-            need_pdf = is_empty(row.get(COLS["pdf"]))
-
-            status = "skipped"
-            found_img = None; found_pdf = None; page = None; used_pass = None; host = None
-
-            if not (need_img or need_pdf):
-                status = "already had URLs"
-            else:
-                img, pdf, page, host, used_pass = try_enrich_webwide(brand, ref, art, s, sleep_s)
-                if img or pdf:
-                    if need_img and img: df.at[i, COLS["img"]] = img
-                    if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
-                    status = "filled"; found_img, found_pdf = img, pdf; filled += 1
-                else:
-                    status = "no match"
-
-            rows.append({
-                "row": i+1,
-                "cod_articulo_naves": cod_art,
-                "ref_proveedor": ref,
-                "proveedor_raw": prov_raw,
-                "brand_detected": brand or "",
-                "chosen_host": host or "",
-                "search_pass": used_pass or "",
-                "product_page": page or "",
-                "found_image": found_img or "",
-                "found_pdf": found_pdf or "",
-                "status": status
-            })
-
-    except QuotaExceeded as e:
-        print(f"[WARN] {e}. Guardando progreso parcial…")
-        # marca las filas NO procesadas en este lote como cuota excedida
-        for j in range(len(rows) + start, end):
-            r = df.iloc[j]
-            rows.append({
-                "row": j+1,
-                "cod_articulo_naves": r.get(COLS["cod_art"]),
-                "ref_proveedor": r.get(COLS["refprov"]),
-                "proveedor_raw": r.get(COLS["prov"]),
-                "brand_detected": "",
-                "chosen_host": "",
-                "search_pass": "quota_exceeded",
-                "product_page": "",
-                "found_image": "",
-                "found_pdf": "",
-                "status": "quota_exceeded"
-            })
-        # seguimos a guardar outputs y salimos con 0 para no romper el pipeline
-    finally:
-        df.to_excel(args.out, index=False)
-        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
-        if rows:
-            with open(args.report, "w", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader(); w.writerows(rows)
-        print(f"[OK] Enrichment partial/complete. Rows updated: {filled}.")
-        print(f"[OK] Outputs: {args.out} and {args.report}")
-
-if __name__ == "__main__":
-    main()
+            # Regla: excluir FAMARA
+            if is_excluded_provider(prov_raw):
+                rows.append({
+                    "row": i+1,
+                    "cod_articulo_naves": cod_art,
+                    "ref_proveedor": ref,
+                    "proveedor_raw": prov_raw,
+                    "brand_detected": brand or "",
+                    "chosen_host": "",
+                    "search_pass": "proveedor_excluido",
+                    "product_page": "",
+                    "found_image": "",
+                    "found_pdf": "",
+                    "status": "skipped_by_rule"
+                })
+                cont
