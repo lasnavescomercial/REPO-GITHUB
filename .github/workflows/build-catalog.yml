@@ -10,21 +10,10 @@ on:
         description: 'Excel path (default: data/RESUMEN_CATALOGO.xlsx)'
         required: false
         default: 'data/RESUMEN_CATALOGO.xlsx'
-      rows_limit:
-        description: 'Máximo de filas a procesar en esta ejecución (0 = todas)'
-        required: false
-        default: '40'
-      offset:
-        description: 'Fila inicial (0-based) para procesar por lotes'
-        required: false
-        default: '0'
       provider_contains:
-        description: 'Procesar SOLO filas cuyo campo "Proveedor" contenga este texto (ej.: FLUIDRA). Vacío = todas'
+        description: 'Filtrar por "Proveedor" (p.ej. FLUIDRA). Vacío = todas'
         required: false
         default: 'FLUIDRA'
-  push:
-    paths:
-      - 'data/**'
 
 jobs:
   build:
@@ -55,14 +44,44 @@ jobs:
           if [ -z "${GOOGLE_CSE_CX}" ]; then echo "ERROR: GOOGLE_CSE_CX is missing"; exit 1; fi
           echo "OK: both secrets are present"
 
-      - name: Enrich URLs
+      # ---------- NUEVO: crear SUBSET solo con filas cuyo Proveedor contiene X ----------
+      - name: Make provider subset (only rows that match)
+        env:
+          EXCEL_IN: ${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}
+          PROV:     ${{ github.event.inputs.provider_contains }}
+        run: |
+          python - << 'PY'
+          import pandas as pd, os, re, unicodedata, sys
+          def norm(s):
+              s = str(s or '').upper()
+              s = unicodedata.normalize('NFKD', s)
+              s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+              return re.sub(r'[^A-Z0-9]+',' ', s).strip()
+          excel_in = os.environ['EXCEL_IN']
+          prov     = os.environ.get('PROV','').strip()
+          df = pd.read_excel(excel_in)
+          if not prov:
+              df2 = df.copy()
+              note = '(sin filtro)'
+          else:
+              nf = norm(prov)
+              df2 = df[df['Proveedor'].apply(lambda x: nf in norm(x))]
+              note = f'(filtro="{prov}")'
+          print(f"[INFO] Subset {note}: {len(df2)}/{len(df)} filas.")
+          # dump los primeros 10 proveedores para ver qué hay realmente
+          print("[INFO] Primeros proveedores en subset:")
+          print(df2['Proveedor'].head(10).to_string(index=False))
+          os.makedirs('data', exist_ok=True)
+          df2.to_excel('data/RESUMEN_CATALOGO_subset.xlsx', index=False)
+          PY
+
+      # ---------- Enriquecer SOLO el subset ----------
+      - name: Enrich URLs (subset)
         run: |
           python scripts/enrich_urls.py \
-            --excel "${{ github.event.inputs.excel_path || 'data/RESUMEN_CATALOGO.xlsx' }}" \
-            --out "data/RESUMEN_CATALOGO_READY.xlsx" \
+            --excel  "data/RESUMEN_CATALOGO_subset.xlsx" \
+            --out    "data/RESUMEN_CATALOGO_READY.xlsx" \
             --report "data/ENRICHMENT_REPORT.csv" \
-            --limit "${{ github.event.inputs.rows_limit }}" \
-            --offset "${{ github.event.inputs.offset }}" \
             --sleep-ms 1100 \
             --provider-contains "${{ github.event.inputs.provider_contains }}"
 
@@ -78,6 +97,7 @@ jobs:
           name: ENRICHMENT_REPORT
           path: data/ENRICHMENT_REPORT.csv
 
+      # ---------- Descargar SOLO del subset enriquecido ----------
       - name: Run downloader
         run: |
           python scripts/download_catalog.py \
