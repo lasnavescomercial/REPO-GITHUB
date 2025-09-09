@@ -5,9 +5,8 @@ from pathlib import Path
 import requests, pandas as pd
 from bs4 import BeautifulSoup
 
-print("[INFO] Engine: GOOGLE CSE (webwide) | Regla: excluir FAMARA | Filtro opcional --brand-only")
+print("[INFO] Engine: GOOGLE CSE (webwide) | Filtro: --provider-contains | Regla: excluir FAMARA")
 
-# --- Config/constantes ---
 BLACKLIST = {
     "amazon.", "ebay.", "aliexpress.", "alibaba.", "leroymerlin.", "manomano.",
     "pinterest.", "facebook.", "instagram.", "youtube.", "issuu.", "scribd.",
@@ -22,7 +21,7 @@ ALIASES = {
     "":        ["LAS NAVES", "ALMACENES", "DISTRIBUIDOR", "PROVEEDOR"]
 }
 
-EXCLUDE_PROVIDERS = {"FAMARA"}  # excluye filas de este proveedor
+EXCLUDE_PROVIDERS = {"FAMARA"}  # normalizado
 
 COLS = {
     "cod_art": "Cód. Articulo Naves",
@@ -189,7 +188,7 @@ def main():
     ap.add_argument("--limit",  type=int, default=0)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--sleep-ms", type=int, default=1100)
-    ap.add_argument("--brand-only", default="", help="Procesar SOLO filas cuya marca detectada sea esta (p.ej. FLUIDRA). Vacío = todas")
+    ap.add_argument("--provider-contains", default="", help='Procesar SOLO filas cuyo "Proveedor" contenga este texto (normalizado). Vacío = todas')
     args = ap.parse_args()
 
     if not os.path.exists(args.excel):
@@ -205,13 +204,15 @@ def main():
     s.headers.update({"User-Agent":"Mozilla/5.0"})
     sleep_s = max(0.0, args.sleep_ms / 1000.0)
 
-    brand_only = norm_text(args.brand_only)
+    prov_filter = norm_text(args.provider_contains)
     total = len(df); filled = 0
     rows = []
     start = max(0, int(args.offset))
     end = total if int(args.limit) == 0 else min(total, start + int(args.limit))
 
-    print(f"[INFO] Processing rows {start}..{end-1} of {total} (limit={args.limit}, offset={args.offset}, brand_only='{args.brand_only}')")
+    print(f"[INFO] Processing rows {start}..{end-1} of {total} (limit={args.limit}, offset={args.offset}, provider_contains='{args.provider_contains}')")
+
+    counts = {"processed":0, "filled":0, "skipped_provider":0, "skipped_excluded":0, "no_match":0, "already":0}
 
     class QuotaExceeded(Exception): pass
 
@@ -224,7 +225,9 @@ def main():
             prov_raw = str(row.get(COLS["prov"]) or "").strip()
             brand    = canonical_brand(prov_raw)
 
+            # Excluir FAMARA
             if is_excluded_provider(prov_raw):
+                counts["skipped_excluded"] += 1
                 rows.append({
                     "row": i+1, "cod_articulo_naves": cod_art, "ref_proveedor": ref,
                     "proveedor_raw": prov_raw, "brand_detected": brand or "",
@@ -234,13 +237,15 @@ def main():
                 })
                 continue
 
-            if brand_only and norm_text(brand) != brand_only:
+            # Filtro: Proveedor contiene X
+            if prov_filter and prov_filter not in norm_text(prov_raw):
+                counts["skipped_provider"] += 1
                 rows.append({
                     "row": i+1, "cod_articulo_naves": cod_art, "ref_proveedor": ref,
                     "proveedor_raw": prov_raw, "brand_detected": brand or "",
-                    "chosen_host": "", "search_pass": "skipped_brand_only",
+                    "chosen_host": "", "search_pass": "skipped_provider_filter",
                     "product_page": "", "found_image": "", "found_pdf": "",
-                    "status": "skipped_by_brand"
+                    "status": "skipped_by_provider"
                 })
                 continue
 
@@ -251,8 +256,10 @@ def main():
             found_img = None; found_pdf = None; page = None; used_pass = None; host = None
 
             if not (need_img or need_pdf):
+                counts["already"] += 1
                 status = "already had URLs"
             else:
+                counts["processed"] += 1
                 try:
                     img, pdf, page, host, used_pass = try_enrich_webwide(brand, ref, art, s, sleep_s)
                 except Exception as e:
@@ -261,8 +268,10 @@ def main():
                 if img or pdf:
                     if need_img and img: df.at[i, COLS["img"]] = img
                     if need_pdf and pdf: df.at[i, COLS["pdf"]] = pdf
-                    status = "filled"; found_img, found_pdf = img, pdf; filled += 1
+                    counts["filled"] += 1
+                    status = "filled"; found_img, found_pdf = img, pdf
                 else:
+                    counts["no_match"] += 1
                     status = "no match"
 
             rows.append({
@@ -290,7 +299,7 @@ def main():
             with open(args.report, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 w.writeheader(); w.writerows(rows)
-        print(f"[OK] Enrichment partial/complete. Rows updated: {filled}.")
+        print(f"[OK] Summary: ", counts)
         print(f"[OK] Outputs: {args.out} and {args.report}")
 
 if __name__ == "__main__":
